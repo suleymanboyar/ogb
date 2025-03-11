@@ -1,126 +1,192 @@
-from ogb.nodeproppred import PygNodePropPredDataset
+#!/usr/bin/env python
+import warnings
+
 import torch
 import torch_geometric.transforms as T
 import torch.nn.functional as F
-import warnings
+
+from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
 
 from torch_geometric.data import DataLoader
 from torch_geometric.nn import SAGEConv
 from torch_geometric.loader import NeighborLoader
+from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops
 
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
 
-# Values taken from GraphSAGE's paper
-S1 = 25
-S2 = 10
-BATCH_SIZE=512
-# They used 10 epochs for another dataset and got good result with it, 
-# while its not enough for ogbn-arxiv
-EPOCHS = 80
+# Constants
+LEARNING_RATE = 0.01
+WEIGHT_DECAY = 5e-4
+EPOCHS = 2000
+RUNS = 10
 
-dataset = PygNodePropPredDataset(name = "ogbn-arxiv", root = './data')
+# Load dataset (full graph)
+dataset = PygNodePropPredDataset(name="ogbn-arxiv", root='/global/D1/homes/sboyar/dataset/ogb/data')
 data = dataset[0]
+split_idx = dataset.get_idx_split()
 
-split_detaset = dataset.get_idx_split()
+# Move everything to device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
-train_loader = NeighborLoader(
-    data,
-    num_neighbors=[S1,S2],
-    batch_size=BATCH_SIZE,
-    input_nodes=split_detaset["train"],
-    shuffle=True
-)
 
-valid_loader = NeighborLoader(
-    data,
-    num_neighbors=[S1,S2],
-    batch_size=BATCH_SIZE,
-    input_nodes=split_detaset["valid"],
-    shuffle=False
-)
+transform = T.Compose([T.ToUndirected(), T.AddSelfLoops()])
+data = transform(data)
+data.to(device)
 
-test_loader = NeighborLoader(
-    data,
-    num_neighbors=[S1,S2],
-    batch_size=BATCH_SIZE,
-    input_nodes=split_detaset["test"],
-    shuffle=False
-)
+# Preprocess graph (once)
+data.x = data.x.to(device)
+data.y = data.y.to(device)
+data.edge_index = to_undirected(data.edge_index)
+data.edge_index, _ = remove_self_loops(data.edge_index)
+data.edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
+data.edge_index = data.edge_index.to(device)
+
+# Convert split indices to device
+for key in split_idx:
+    split_idx[key] = split_idx[key].to(device)
 
 class GNN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, aggr='mean', normalize=True, project=False, num_layers=2, dropout=0.0):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels, aggr='max', normalize=True, project=True)
-        self.conv2 = SAGEConv(hidden_channels, out_channels, aggr='max', normalize=True, project=True)
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(SAGEConv(in_channels, hidden_channels, aggr=aggr, normalize=normalize, project=project))
+        self.bns = torch.nn.ModuleList()
+        self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+
+        for _ in range(num_layers - 2):
+            self.convs.append(SAGEConv(hidden_channels, hidden_channels, aggr=aggr, normalize=normalize, project=project))
+            self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+
+        self.convs.append(SAGEConv(hidden_channels, out_channels, aggr=aggr, normalize=normalize, project=project))
+        self.dropout = dropout
 
     def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index).relu()
-        x = self.conv2(x, edge_index)
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, edge_index)
+            x = self.bns[i](x)
+            x = x.relu()
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.convs[-1](x, edge_index)
         return x
 
-def train(model, loader):
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+
+def train(model, optimizer):
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 
-    avg_loss = 0
+    # Full-batch forward pass
+    optimizer.zero_grad()
+    out = model(data.x, data.edge_index)
 
-    for epoch in range(EPOCHS):
-        total_loss = 0
-        num_batches = 0
+    # Only compute loss on training nodes
+    loss = F.cross_entropy(out[split_idx['train']], data.y.squeeze(1)[split_idx['train']])
+    loss.backward()
+    optimizer.step()
 
-        print(f'Epoch {epoch+1:03d}/{EPOCHS} starting...')
+    return loss.item()
 
-        for batch in loader:
-
-            optimizer.zero_grad()
-            out = model(batch.x, batch.edge_index)
-            # Get only the output for target nodes (not neighbor nodes)
-            # In NeighborLoader, the first batch.batch_size nodes are the target nodes
-            out = out[:batch.batch_size]
-            target = batch.y.squeeze()[:batch.batch_size]
-            loss = F.cross_entropy(out, target)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-            if num_batches % 10 == 0:
-                print(f'  Batch {num_batches}, Current Loss: {loss.item():.4f}')
-
-        avg_loss = total_loss / num_batches
-        print(f'Epoch: {epoch+1:03d}/{EPOCHS} completed, Avg Loss: {avg_loss:.4f}')
-
-    return avg_loss
-
-def evaluate(model, loader):
+@torch.no_grad()
+def test(model, evaluator):
     model.eval()
-    correct = 0
-    total = 0
 
-    with torch.no_grad():
-        for batch in loader:
-            out = model(batch.x, batch.edge_index)
-            # Get only predictions for target nodes
-            target_nodes = batch.batch_size
-            out = out[:target_nodes]
-            pred = out.argmax(dim=1)
-            # Get ground truth labels, squeeze if needed
-            if batch.y.dim() > 1:
-                target = batch.y.squeeze()[:target_nodes]
-            else:
-                target = batch.y[:target_nodes]
-            # Calculate accuracy
-            correct += (pred == target).sum().item()
-            total += target_nodes
+    # Full-batch forward pass
+    out = model(data.x, data.edge_index)
+    y_pred = out.argmax(dim=-1, keepdim=True)
 
-    return correct / total
+    # Evaluate on all splits
+    train_acc = evaluator.eval({
+        'y_true': data.y[split_idx['train']],
+        'y_pred': y_pred[split_idx['train']],
+    })['acc']
+
+    valid_acc = evaluator.eval({
+        'y_true': data.y[split_idx['valid']],
+        'y_pred': y_pred[split_idx['valid']],
+    })['acc']
+
+    test_acc = evaluator.eval({
+        'y_true': data.y[split_idx['test']],
+        'y_pred': y_pred[split_idx['test']],
+    })['acc']
+
+    return train_acc, valid_acc, test_acc
+
+def save_model(model, optimizer, epoch, best_val_acc, best_test_acc, path):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_acc': best_val_acc,
+        'best_test_acc': best_test_acc,
+    }, path)
+    print(f"Model saved to {path}")
+
+def load_and_evaluate_model(path):
+    # Create a new model instance
+    model = GNN(
+        in_channels=dataset.num_features,
+        hidden_channels=HIDDEN_DIM,
+        out_channels=dataset.num_classes,
+        num_layers=NUM_LAYERS,
+        dropout=DROPOUT
+    ).to(device)
+
+    # Load the saved state
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Evaluate
+    train_acc, val_acc, test_acc = test(model)
+
+    print(f"Loaded model from epoch {checkpoint['epoch']}")
+    print(f"Final performance:")
+    print(f"Train accuracy: {100 * train_acc:.2f}%")
+    print(f"Validation accuracy: {100 * val_acc:.2f}%")
+    print(f"Test accuracy: {100 * test_acc:.2f}%")
 
 def main():
-    model = GNN(in_channels=dataset.num_features, hidden_channels=128, out_channels=dataset.num_classes)
-    train(model, train_loader)
-    test_acc = evaluate(model, test_loader)
-    print(f'Test Accuracy: {test_acc:.4f}')
+    # Create the model
+    model = GNN(
+        in_channels=dataset.num_features,
+        hidden_channels=256,
+        out_channels=dataset.num_classes,
+        dropout=0.5
+    ).to(device)
+
+    # Setup evaluator
+    evaluator = Evaluator(name='ogbn-arxiv')
+
+    for run in range(1, RUNS+1):
+        print(f"Run {run}/{RUNS}")
+        model.reset_parameters()
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+        best_val_acc = 0
+        best_test_acc = 0
+
+        for epoch in range(1, EPOCHS+1):
+            # Training
+            loss = train(model, optimizer)
+
+            # Evaluation
+            if epoch % 10 == 0 or epoch == EPOCHS:
+                train_acc, val_acc, test_acc = test(model, evaluator)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+
+                print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+                      f'Train: {100 * train_acc:.2f}%, '
+                      f'Valid: {100 * val_acc:.2f}%, '
+                      f'Test: {100 * test_acc:.2f}%, '
+                      f'Best Valid: {100 * best_val_acc:.2f}%, '
+                      f'Best Test: {100 * best_test_acc:.2f}%')
     
 if __name__ == "__main__":
     main()
